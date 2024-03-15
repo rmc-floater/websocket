@@ -21,7 +21,7 @@ func TestWSHandler(t *testing.T) {
 	var p ws.WSPumper
 	reg := make(chan ws.WSPumper)
 	dereg := make(chan ws.WSPumper)
-	manager := ws.BasicBroadcasterFactory()
+	manager := ws.NewManager()
 	upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
 	testBytes := []byte("testing")
 
@@ -32,7 +32,7 @@ func TestWSHandler(t *testing.T) {
 	h := ws.ServeWS(
 		upgrader,
 		func(r *http.Request) bool { return true },
-		ws.DefaultPumperFactory,
+		ws.NewPumper,
 		func(_p ws.WSPumper) {
 			p = _p
 			manager.RegisterClient(p)

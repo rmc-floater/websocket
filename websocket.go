@@ -98,8 +98,8 @@ type BasicPumper struct {
 	egress chan []byte
 }
 
-// DefaultPumperFactory is a convenience function for returning a new WSPumper
-func DefaultPumperFactory(c *websocket.Conn) WSPumper {
+// NewPumper is a convenience function for returning a new WSPumper
+func NewPumper(c *websocket.Conn) WSPumper {
 	return &BasicPumper{
 		conn:   c,
 		egress: make(chan []byte, 32),
@@ -232,7 +232,7 @@ type regreq struct {
 	done chan struct{}
 }
 
-func BasicBroadcasterFactory() WSManager {
+func NewManager() WSManager {
 	return &BasicBroadcaster{
 		lock:       sync.RWMutex{},
 		clients:    make(map[WSPumper]struct{}),
@@ -317,7 +317,10 @@ func (bb *BasicBroadcaster) Run(ctx context.Context) {
 }
 
 func (bb *BasicBroadcaster) Broadcast(b []byte) {
+	bb.lock.RLock()
+	defer bb.lock.RUnlock()
 	for w := range bb.clients {
 		w.Write(b)
 	}
+
 }
