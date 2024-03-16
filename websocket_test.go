@@ -18,11 +18,12 @@ func TestWSHandler(t *testing.T) {
 	is := is.New(t)
 	ctx := context.Background()
 
-	var p ws.WSPumper
-	reg := make(chan ws.WSPumper)
-	dereg := make(chan ws.WSPumper)
+	var p ws.Client
+	reg := make(chan ws.Client)
+	dereg := make(chan ws.Client)
 	manager := ws.NewManager()
 	upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
 	testBytes := []byte("testing")
 
 	// run the manager
@@ -31,19 +32,18 @@ func TestWSHandler(t *testing.T) {
 	// setup the handler
 	h := ws.ServeWS(
 		upgrader,
-		func(r *http.Request) bool { return true },
-		ws.NewPumper,
-		func(_p ws.WSPumper) {
+		ws.DefaultSetupConn,
+		ws.NewClient,
+		func(_p ws.Client) {
 			p = _p
 			manager.RegisterClient(p)
 			reg <- p
 		},
-		func(_p ws.WSPumper) {
+		func(_p ws.Client) {
 			manager.UnregisterClient(_p)
 			dereg <- _p
 		},
 		50*time.Second,
-		ws.DefaultSetupConn,
 		[]func([]byte){func(b []byte) { p.Write(b) }},
 	)
 

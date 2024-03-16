@@ -8,11 +8,11 @@ The main entry point for this package is the `ServeWS` function, which returns a
 
 ## Interfaces
 
-There are two interfaces: `WSPumper` and `WSManager`. The package provides example implementations, but consumers are free to implement their own.
+There are two interfaces: `Pumper` and `Manager`. The package provides example implementations, but consumers are free to implement their own.
 
-`WSPumper` is responsible for reading (writing) messages from (to) the client and invoking the callbacks on the client messages, which are assumed to be of type `[]byte`.
+`Pumper` is responsible for reading (writing) messages from (to) the client and invoking the callbacks on the client messages, which are assumed to be of type `[]byte`.
 
-`WSManager` is really more of a convenience interface for managing client connections; you don't actually _need_ to use this, but it's helpful.
+`Manager` is really more of a convenience interface for managing client connections; you don't actually _need_ to use this, but it's helpful.
 
 ## Usage
 

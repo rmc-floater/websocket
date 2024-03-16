@@ -22,20 +22,20 @@ func DefaultSetupConn(c *websocket.Conn) {
 	})
 }
 
-// WSPumper is an interface for reading from and writing to a websocket
+// Client is an interface for reading from and writing to a websocket
 // connection. It is designed to be used as a middleman between a service and a
 // client websocket connection.
-type WSPumper interface {
+type Client interface {
 	io.Writer
 	io.Closer
 
 	// WritePump is responsible for writing message to the client (including
 	// ping message)
-	WritePump(time.Duration, func(WSPumper))
+	WritePump(func(Client), time.Duration)
 
 	// ReadPump is responsible for setting up the client connection, reading
 	// connections from the client, and passing them to the handlers
-	ReadPump(func(*websocket.Conn), func(WSPumper), ...func([]byte))
+	ReadPump(func(Client), ...func([]byte))
 }
 
 // ServeWS upgrades HTTP connections to WebSocket, creates the pump, calls the
@@ -44,51 +44,50 @@ type WSPumper interface {
 func ServeWS(
 	// upgrader upgrades the connection
 	upgrader websocket.Upgrader,
-	// oc checks the origin and returns "true" for "good" origins
-	oc func(*http.Request) bool,
-	// factory is a function that takes a connection and returns a WSPumper
-	factory func(*websocket.Conn) WSPumper,
-	// register is a function to call once the WSPumper is created (e.g.,
-	// store it in a some collection on the service for later reference)
-	register func(WSPumper),
-	// unregister is a function to call after the WebSocket connection is closed
-	// (e.g., remove it from the collection on the service)
-	unregister func(WSPumper),
-	// ping is the interval at which ping messages are aren't sent
-	ping time.Duration,
 	// connSetup is called on the upgraded WebSocket connection to configure
 	// the connection
 	connSetup func(*websocket.Conn),
+	// factory is a function that takes a connection and returns a Client
+	factory func(*websocket.Conn) Client,
+	// register is a function to call once the Client is created (e.g.,
+	// store it in a some collection on the service for later reference)
+	register func(Client),
+	// unregister is a function to call after the WebSocket connection is closed
+	// (e.g., remove it from the collection on the service)
+	unregister func(Client),
+	// ping is the interval at which ping messages are aren't sent
+	ping time.Duration,
 	// msgHandlers are callbacks that handle messages received from the client
 	msgHandlers []func([]byte),
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// upgrade
-		upgrader.CheckOrigin = oc
-		c, err := upgrader.Upgrade(w, r, nil)
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			// if Upgrade fails it closes the connection, so just return
 			return
 		}
 
+		// set connection limits and ping/pong settings
+		connSetup(conn)
+
 		// create the interface
-		p := factory(c)
+		client := factory(conn)
 
 		// call the register callback
-		register(p)
+		register(client)
 
 		// run writePump in a separate goroutine; all writes will happen here,
 		// ensuring only one write on the connection at a time
-		go p.WritePump(ping, unregister)
+		go client.WritePump(unregister, ping)
 
 		// run readPump in a separate goroutine; all reads will happen here,
 		// ensuring only one reader on the connection at a time
-		go p.ReadPump(connSetup, unregister, msgHandlers...)
+		go client.ReadPump(unregister, msgHandlers...)
 	}
 }
 
-// This is a convenient example implementation of the WSPumper interface.
-type BasicPumper struct {
+// This is a convenient example implementation of the Client interface.
+type client struct {
 
 	// the underlying websocket connection
 	conn *websocket.Conn
@@ -98,26 +97,26 @@ type BasicPumper struct {
 	egress chan []byte
 }
 
-// NewPumper is a convenience function for returning a new WSPumper
-func NewPumper(c *websocket.Conn) WSPumper {
-	return &BasicPumper{
+// NewClient is a convenience function for returning a new Client
+func NewClient(c *websocket.Conn) Client {
+	return &client{
 		conn:   c,
 		egress: make(chan []byte, 32),
 	}
 }
 
 // Write implements the Writer interface
-func (bp *BasicPumper) Write(p []byte) (int, error) {
-	bp.egress <- p
+func (c *client) Write(p []byte) (int, error) {
+	c.egress <- p
 	return len(p), nil
 }
 
 // Close implements the Closer interface. Note the behavior of calling Close()
 // multiple times is undefined, so we're just going to swallow all errors for
 // now
-func (bp *BasicPumper) Close() error {
-	bp.conn.WriteControl(websocket.CloseMessage, []byte{}, time.Time{})
-	bp.conn.Close()
+func (c *client) Close() error {
+	c.conn.WriteControl(websocket.CloseMessage, []byte{}, time.Time{})
+	c.conn.Close()
 	return nil
 }
 
@@ -127,34 +126,34 @@ func (bp *BasicPumper) Close() error {
 // A goroutine running WritePump is started for each connection. The application
 // ensures that there is at most one writer to a connection by executing all
 // writes from this goroutine.
-func (bp *BasicPumper) WritePump(ping time.Duration, unregisterFunc func(WSPumper)) {
+func (c *client) WritePump(unregisterFunc func(Client), ping time.Duration) {
 
 	// Create a ticker that triggers a ping at given interval
 	pingTicker := time.NewTicker(ping)
 	defer func() {
 		pingTicker.Stop()
-		unregisterFunc(bp)
+		unregisterFunc(c)
 	}()
 
 	for {
 		select {
-		case msgBytes, ok := <-bp.egress:
+		case msgBytes, ok := <-c.egress:
 			// ok will be false in case the egress channel is closed
 			if !ok {
 				// manager has closed this connection channel, so send a close
 				// message and return which will initiate the connection
 				// shutdown process in the manager
-				bp.conn.WriteMessage(websocket.CloseMessage, nil)
+				c.conn.WriteMessage(websocket.CloseMessage, nil)
 				return
 			}
 			// write a message to the connection
-			if err := bp.conn.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
+			if err := c.conn.WriteMessage(websocket.TextMessage, msgBytes); err != nil {
 				// just return to (closes the connection) indiscriminantly in
 				// the case of errors
 				return
 			}
 		case <-pingTicker.C:
-			if err := bp.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
+			if err := c.conn.WriteMessage(websocket.PingMessage, []byte{}); err != nil {
 				// just return to (closes the connection) indiscriminantly in
 				// the case of errors
 				return
@@ -168,22 +167,18 @@ func (bp *BasicPumper) WritePump(ping time.Duration, unregisterFunc func(WSPumpe
 // The application runs ReadPump in a per-connection goroutine. The application
 // ensures that there is at most one reader on a connection by executing all
 // reads from this goroutine.
-func (bp *BasicPumper) ReadPump(
-	setupConn func(*websocket.Conn),
-	unregisterFunc func(WSPumper),
+func (c *client) ReadPump(
+	unregisterFunc func(Client),
 	handlers ...func([]byte),
 ) {
 	// unregister and close before exit
 	defer func() {
-		unregisterFunc(bp)
+		unregisterFunc(c)
 	}()
-
-	// set connection limits and ping/pong settings
-	setupConn(bp.conn)
 
 	// read forever
 	for {
-		_, payload, err := bp.conn.ReadMessage()
+		_, payload, err := c.conn.ReadMessage()
 
 		// handle close (we could check the error here but it doesn't really
 		// matter, something is botched, so just close the connection)
@@ -198,16 +193,16 @@ func (bp *BasicPumper) ReadPump(
 	}
 }
 
-// WSManager maintains the set of active WebSocket clients.
-type WSManager interface {
+// Manager maintains the set of active WebSocket clients.
+type Manager interface {
 	// Clients returns a slice of Clients
-	Clients() []WSPumper
+	Clients() []Client
 
-	// RegisterClient adds the client to the WSManagers internal store
-	RegisterClient(WSPumper)
+	// RegisterClient adds the client to the Managers internal store
+	RegisterClient(Client)
 
-	// UnregisterClient removes the client from the WSManagers internal store
-	UnregisterClient(WSPumper)
+	// UnregisterClient removes the client from the Managers internal store
+	UnregisterClient(Client)
 
 	// Run runs in its own goroutine. It continuously processes client
 	// (un)registration. When a client registers, it is added to the manager's
@@ -216,11 +211,9 @@ type WSManager interface {
 	Run(context.Context)
 }
 
-// BasicBroadcaster is an example implementation of WSManager that has a
-// Broadcast method that writes the supplied message to all clients.
-type BasicBroadcaster struct {
+type manager struct {
 	lock       sync.RWMutex
-	clients    map[WSPumper]struct{}
+	clients    map[Client]struct{}
 	register   chan regreq
 	unregister chan regreq
 }
@@ -228,57 +221,57 @@ type BasicBroadcaster struct {
 // Helper struct for signaling registration/unregistration. The Run() goroutine
 // can signal the operation is done by sending on the done chan.
 type regreq struct {
-	wp   WSPumper
+	wp   Client
 	done chan struct{}
 }
 
-func NewManager() WSManager {
-	return &BasicBroadcaster{
+func NewManager() Manager {
+	return &manager{
 		lock:       sync.RWMutex{},
-		clients:    make(map[WSPumper]struct{}),
+		clients:    make(map[Client]struct{}),
 		register:   make(chan regreq),
 		unregister: make(chan regreq),
 	}
 }
 
-func (bb *BasicBroadcaster) Clients() []WSPumper {
-	res := []WSPumper{}
+func (m *manager) Clients() []Client {
+	res := []Client{}
 
-	bb.lock.RLock()
-	defer bb.lock.RUnlock()
+	m.lock.RLock()
+	defer m.lock.RUnlock()
 
-	for c, _ := range bb.clients {
+	for c, _ := range m.clients {
 		res = append(res, c)
 	}
 	return res
 }
 
-func (bb *BasicBroadcaster) RegisterClient(wp WSPumper) {
+func (m *manager) RegisterClient(wp Client) {
 	done := make(chan struct{})
 	rr := regreq{
 		wp:   wp,
 		done: done,
 	}
-	bb.register <- rr
+	m.register <- rr
 	<-done
 }
 
-func (bb *BasicBroadcaster) UnregisterClient(wp WSPumper) {
+func (m *manager) UnregisterClient(wp Client) {
 	done := make(chan struct{})
 	rr := regreq{
 		wp:   wp,
 		done: done,
 	}
-	bb.unregister <- rr
+	m.unregister <- rr
 	<-done
 }
 
-func (bb *BasicBroadcaster) Run(ctx context.Context) {
+func (m *manager) Run(ctx context.Context) {
 
 	// helper fn for cleaning up client
-	cleanupClient := func(c WSPumper) {
+	cleanupClient := func(c Client) {
 		// delete from map
-		delete(bb.clients, c)
+		delete(m.clients, c)
 		// close connections
 		c.Close()
 	}
@@ -287,36 +280,54 @@ func (bb *BasicBroadcaster) Run(ctx context.Context) {
 	for {
 		select {
 		// register new client
-		case rr := <-bb.register:
+		case rr := <-m.register:
 
-			bb.lock.Lock()
-			bb.clients[rr.wp] = struct{}{}
-			bb.lock.Unlock()
+			m.lock.Lock()
+			m.clients[rr.wp] = struct{}{}
+			m.lock.Unlock()
 			rr.done <- struct{}{}
 
 		// cleanup single client
-		case rr := <-bb.unregister:
+		case rr := <-m.unregister:
 
-			bb.lock.Lock()
-			if _, ok := bb.clients[rr.wp]; ok {
+			m.lock.Lock()
+			if _, ok := m.clients[rr.wp]; ok {
 				cleanupClient(rr.wp)
 			}
-			bb.lock.Unlock()
+			m.lock.Unlock()
 			rr.done <- struct{}{}
 
 		// handle service shutdown
 		case <-ctx.Done():
 
-			bb.lock.Lock()
-			for client := range bb.clients {
+			m.lock.Lock()
+			for client := range m.clients {
 				cleanupClient(client)
 			}
-			bb.lock.Unlock()
+			m.lock.Unlock()
 		}
 	}
 }
 
-func (bb *BasicBroadcaster) Broadcast(b []byte) {
+// Broadcaster is an example implementation of Manager that has a
+// Broadcast method that writes the supplied message to all clients.
+type Broadcaster struct {
+	*manager
+}
+
+func NewBroadcaster() Manager {
+	m := manager{
+		lock:       sync.RWMutex{},
+		clients:    make(map[Client]struct{}),
+		register:   make(chan regreq),
+		unregister: make(chan regreq),
+	}
+	return &Broadcaster{
+		manager: &m,
+	}
+}
+
+func (bb *Broadcaster) Broadcast(b []byte) {
 	bb.lock.RLock()
 	defer bb.lock.RUnlock()
 	for w := range bb.clients {
